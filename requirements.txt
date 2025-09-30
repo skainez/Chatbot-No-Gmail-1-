@@ -3,8 +3,8 @@ uvicorn>=0.15.0
 python-multipart>=0.0.16
 requests>=2.26.0
 transformers==4.30.2
-torch==2.0.1+cpu --index-url https://download.pytorch.org/whl/cpu
-torchvision==0.15.2+cpu --index-url https://download.pytorch.org/whl/cpu
+torch==2.0.1 --index-url https://download.pytorch.org/whl/cpu
+torchvision==0.15.2 --index-url https://download.pytorch.org/whl/cpu
 torchaudio==2.0.2 --index-url https://download.pytorch.org/whl/cpu
 sentence-transformers>=2.3.0
 numpy==1.20.0

@@ -1,0 +1,763 @@
+# --- Required Imports ---
+from fastapi import FastAPI, WebSocket, Request, WebSocketDisconnect
+from fastapi.templating import Jinja2Templates
+from fastapi.staticfiles import StaticFiles
+from datetime import datetime
+import json
+import logging
+import uuid
+
+# --- Logger Setup ---
+logger = logging.getLogger("chatbot")
+logger.setLevel(logging.INFO)
+if not logger.hasHandlers():
+    handler = logging.StreamHandler()
+    formatter = logging.Formatter("%(asctime)s %(levelname)s %(message)s")
+    handler.setFormatter(formatter)
+    logger.addHandler(handler)
+
+# --- Conversation State ---
+class ConversationState:
+    def __init__(self):
+        self.step: str = "get_name"
+        self.user_data: dict[str, str] = {}
+        self.active_campaign: str | None = None
+
+# --- Active Conversations ---
+active_conversations = {}
+
+# --- Age Calculation Helper ---
+def calculate_age(dob_str: str) -> str:
+    try:
+        dob = datetime.strptime(dob_str, "%d/%m/%Y")
+        today = datetime.today()
+        age = today.year - dob.year - ((today.month, today.day) < (dob.month, dob.day))
+        return str(age)
+    except Exception:
+        return "Unknown"
+
+app = FastAPI()
+templates = Jinja2Templates(directory="templates")
+
+# Mount static files
+app.mount("/static", StaticFiles(directory="static"), name="static")
+
+
+@app.get("/")
+async def root(request: Request):
+    return templates.TemplateResponse("index.html", {"request": request})
+
+@app.websocket("/ws")
+async def websocket_endpoint(websocket: WebSocket):
+    await websocket.accept()
+    conv_id = str(uuid.uuid4())
+    active_conversations[conv_id] = ConversationState()
+    
+    try:
+        # Send welcome message
+        await websocket.send_json({
+            "type": "message",
+            "content": "Hello! Welcome to KKMJP Super Agent. Let's get started by collecting some basic information."
+        })
+        
+  
+        
+        # Start conversation handler
+        state = active_conversations[conv_id]
+        state.step = "get_name"
+        await handle_websocket_connection(websocket, conv_id)
+    except Exception as e:
+        logger.error(f"Error in WebSocket connection: {str(e)}", exc_info=True)
+        try:
+            await websocket.send_json({
+                "type": "error",
+                "content": "An error occurred. Please refresh the page and try again."
+            })
+        except:
+            pass
+    finally:
+        if conv_id in active_conversations:
+            del active_conversations[conv_id]
+
+async def send_text(ws: WebSocket, message: str, is_user: bool = False) -> None:
+    """Send a text message through WebSocket with error handling and logging.
+    
+    Args:
+        ws: WebSocket connection
+        message: Message text to send
+        is_user: Whether the message is from the user (for UI display)
+        
+    Raises:
+        WebSocketDisconnect: If the connection is closed
+    """
+    if not message or not isinstance(message, str):
+        logger.warning("Attempted to send empty or invalid message")
+        return
+        
+    message = message.strip()
+    if not message:
+        return
+        
+    try:
+        payload = {
+            "type": "message",
+            "content": message,
+            "is_user": is_user,
+            "timestamp": datetime.utcnow().isoformat()
+        }
+        
+        await ws.send_text(json.dumps(payload, ensure_ascii=False))
+        logger.debug(f"Sent message to {id(ws)}: {message[:100]}{'...' if len(message) > 100 else ''}")
+        
+    except WebSocketDisconnect:
+        logger.warning("WebSocket disconnected while sending message")
+        raise
+    except Exception as e:
+        logger.error(f"Error sending WebSocket message: {str(e)}", exc_info=True)
+        # Attempt to notify client of the error
+        try:
+            error_payload = {
+                "type": "error",
+                "content": "Message delivery failed. Please try again.",
+                "is_user": False
+            }
+            await ws.send_text(json.dumps(error_payload, ensure_ascii=False))
+        except:
+            pass
+        raise
+
+async def send_buttons(ws: WebSocket, message: str, buttons: list[dict[str, str]]) -> None:
+    """Send a message with interactive buttons through WebSocket.
+    
+    Args:
+        ws: WebSocket connection
+        message: Message text to display above buttons
+        buttons: List of button dictionaries with 'label' and 'value' keys
+    """
+    try:
+        message_data: dict[str, str | list[dict[str, str]]] = {
+            "type": "buttons",
+            "text": message,
+            "buttons": buttons,
+            "message": message,
+            "timestamp": datetime.now().isoformat()
+        }
+        logger.info(f"Sending message with buttons: {json.dumps(message_data, indent=2)}")
+        await ws.send_json(message_data)
+    except Exception as e:
+        logger.error(f"Error sending buttons: {e}")
+        raise
+
+async def send_question(ws: WebSocket, message: str, input_type: str = "text") -> None:
+    """Send a question that expects a text or number input.
+    
+    Args:
+        ws: WebSocket connection
+        message: The question to ask
+        input_type: Type of input expected ('text' or 'number')
+    """
+    try:
+        await ws.send_json({
+            "type": "question",
+            "content": message,
+            "input_type": input_type
+        })
+    except Exception as e:
+        logger.error(f"Error sending question: {e}")
+        raise
+
+async def show_campaign_options(ws: WebSocket, state: ConversationState, show_all: bool = False) -> None:
+    """Display available campaign options to the user based on their profile.
+    
+    Args:
+        ws: WebSocket connection
+        state: Current conversation state with user data
+        show_all: If True, show all campaigns regardless of priority
+    """
+    try:
+        # Get user data for personalized recommendations
+        primary_concern = state.user_data.get("primary_concern", "")
+        life_stage = state.user_data.get("life_stage", "")
+        dependents = int(state.user_data.get("dependents", 0))
+        
+        # Define all available campaigns with their priority logic
+        # Get user's age, defaulting to 0 if not set or invalid
+        try:
+            user_age = int(state.user_data.get("age", 0))
+        except (ValueError, TypeError):
+            user_age = 0
+            
+        all_campaigns = [
+            {
+                "id": "satu_gaji_satu_harapan",
+                "title": "Satu Gaji Satu Harapan",
+                "description": "Income protection plan that ensures your family's financial stability",
+                "priority": 1 if primary_concern in ["income_protection", "medical_expenses"] or dependents > 0 else 0
+            },
+            {
+                "id": "tabung_warisan",
+                "title": "Tabung Warisan",
+                "description": "Legacy planning to secure your family's future",
+                "priority": 1 if primary_concern in ["retirement", "savings"] or user_age >= 40 else 0
+            },
+            {
+                "id": "tabung_perubatan",
+                "title": "Tabung Perubatan",
+                "description": "Comprehensive medical coverage for you and your family",
+                "priority": 1 if primary_concern in ["medical_expenses", "health"] else 0
+            },
+            {
+                "id": "masa_depan_anak_kita",
+                "title": "Masa Depan Anak Kita",
+                "description": "Education savings plan for your children's future",
+                "priority": 1 if primary_concern == "education" or dependents > 0 else 0
+            },
+            {
+                "id": "perlindungan_combo",
+                "title": "Perlindungan Combo",
+                "description": "Comprehensive protection plan covering multiple needs",
+                "priority": 0  # Default/low priority
+            }
+        ]
+        
+        # Store which campaigns are being shown in user data for reference
+        if show_all:
+            state.user_data['displayed_campaigns'] = [campaign['id'] for campaign in all_campaigns]
+        else:
+            state.user_data['displayed_campaigns'] = [campaign['id'] for campaign in all_campaigns if campaign['priority'] > 0]
+            if not state.user_data['displayed_campaigns']:  # If no prioritized campaigns
+                state.user_data['displayed_campaigns'] = [campaign['id'] for campaign in all_campaigns]
+        
+        if show_all:
+            # Show all campaigns with their descriptions
+            message = "Here are all available options:"
+            campaigns = all_campaigns
+        else:
+            # Sort campaigns by priority (highest first) and take top 3
+            campaigns = sorted(all_campaigns, key=lambda x: x["priority"], reverse=True)[:3]
+            message = "Based on your profile, I recommend the following options:"
+            
+            # If no prioritized campaigns, show all
+            if not any(campaign["priority"] > 0 for campaign in campaigns):
+                campaigns = all_campaigns
+                message = "Here are all available options:"
+        
+        # Create buttons for the campaigns with proper spacing
+        buttons = []
+        for i, campaign in enumerate(campaigns, 1):
+            buttons.append({
+                "label": f"{i}. {campaign['title']}",
+                "value": str(i),
+                "campaign_id": campaign["id"]
+            })
+        
+        # Add 'Show all' option if not already showing all
+        if not show_all:
+            buttons.append({
+                "label": "Show me all options",
+                "value": "all"
+            })
+        
+        # Send the message with buttons
+        # First send the message text
+        await send_text(ws, message)
+        # Then send the buttons separately
+        await send_buttons(ws, "Please select an option:", buttons)
+        
+    except Exception as e:
+        logger.error(f"Error showing campaign options: {str(e)}", exc_info=True)
+        # Fallback to all options
+        await send_text(ws, "Here are all available options:")
+        await send_buttons(
+            ws,
+            "Please select an option:",
+            [
+                {"label": "1. Satu Gaji Satu Harapan (Income Protection)", "value": "1", "campaign_id": "satu_gaji_satu_harapan"},
+                {"label": "2. Tabung Perubatan (Medical)", "value": "2", "campaign_id": "tabung_perubatan"},
+                {"label": "3. Masa Depan Anak Kita (Education)", "value": "3", "campaign_id": "masa_depan_anak_kita"},
+                {"label": "4. Tabung Warisan (Retirement)", "value": "4", "campaign_id": "tabung_warisan"},
+                {"label": "5. Perlindungan Combo (Comprehensive)", "value": "5", "campaign_id": "perlindungan_combo"}
+            ]
+        )
+
+async def log_conversation_state(state: ConversationState, message: str = "") -> None:
+    """Log the current conversation state for debugging.
+    
+    Args:
+        state: The current conversation state
+        message: Optional message to include in the log
+    """
+    logger.info(f"[Conversation State] {message}")
+    logger.info(f"Current step: {state.step}")
+    logger.info(f"User data: {json.dumps(state.user_data, indent=2, default=str)}")
+    if state.active_campaign:
+        logger.info(f"Active campaign: {state.active_campaign}")
+
+async def handle_websocket_connection(ws: WebSocket, conv_id: str):
+    """Handle WebSocket connection and route messages to the appropriate campaign handler.
+    
+    Args:
+        ws: WebSocket connection
+        conv_id: Unique conversation ID
+    """
+    if conv_id not in active_conversations:
+        logger.error(f"No active conversation found for ID: {conv_id}")
+        await ws.close(code=1008, reason="Invalid conversation ID")
+        return
+        
+    state = active_conversations[conv_id]
+    conversation_active = True
+    
+    # Import campaign modules
+    try:
+        from Campaign1.satu_gaji_satu_harapan import sgsa_campaign
+        from Campaign2.tabung_warisan import tabung_warisan_campaign
+        campaign_handlers = {
+            "satu_gaji_satu_harapan": sgsa_campaign,
+            "tabung_warisan": tabung_warisan_campaign,
+            # Add other campaign handlers here as needed
+        }
+    except ImportError as e:
+        logger.error(f"Failed to import campaign modules: {str(e)}")
+        await ws.send_json({
+            "type": "error",
+            "content": "System error: Failed to load campaign modules. Please try again later."
+        })
+        return
+    
+    # Initialize response variable
+    response = None
+    
+    while conversation_active:
+        try:
+            # Reset response for each iteration
+            response = None
+            
+            # Receive message from client
+            data = await ws.receive_text()
+            if not data:
+                logger.warning(f"Received empty message from client {conv_id}")
+                continue
+                
+            # Parse JSON if needed (for structured messages)
+            try:
+                message_data = json.loads(data)
+                message_type = message_data.get("type", "message")
+                # Check different possible fields for the message content
+                message_content = message_data.get("content", 
+                                        message_data.get("text", 
+                                            message_data.get("message", 
+                                                message_data.get("choice", "")
+                                            )
+                                        )
+                                    )
+                # If we still don't have content, use the raw data
+                if not message_content and isinstance(data, str):
+                    message_content = data
+            except (json.JSONDecodeError, AttributeError):
+                message_type = "message"
+                message_content = data if isinstance(data, str) else str(data)
+            
+            logger.info(f"Received message from {conv_id}: {message_type} - {message_content[:200]}")
+            
+            # Handle campaign-specific messages
+            if state.active_campaign and state.active_campaign in campaign_handlers:
+                try:
+                    campaign_result = await campaign_handlers[state.active_campaign].process_message(
+                        user_id=conv_id,
+                        message=message_content,
+                        ws=ws
+                    )
+                    
+                    # Handle campaign completion
+                    if campaign_result.get("completed", False):
+                        state.active_campaign = None
+                        await show_campaign_options(ws, state)
+                        continue
+                        
+                except Exception as e:
+                    logger.error(f"Error in campaign {state.active_campaign}: {str(e)}", exc_info=True)
+                    await send_text(ws, "I'm sorry, there was an error processing your request in the campaign.")
+                    state.active_campaign = None
+                    await show_campaign_options(ws, state)
+                    continue
+            
+            # Main conversation flow
+            elif state.step == "get_name":
+                name = message_content.strip()
+                # Simple validation - just check if there's any text
+                if not name.strip():
+                    await send_text(ws, "Please enter your name.")
+                    continue
+                
+                # Capitalize the name properly
+                name = ' '.join(word.capitalize() for word in name.split())
+                state.user_data["name"] = name
+                await send_question(ws, "What is your date of birth? (DD/MM/YYYY)")
+                state.step = "get_dob"
+                
+            elif state.step == "get_dob":
+                import re
+                dob = message_content.strip()
+                # Validate date format DD/MM/YYYY
+                if not re.match(r'^\d{2}/\d{2}/\d{4}$', dob):
+                    await send_text(ws, "Please enter your date of birth in DD/MM/YYYY format:")
+                    continue
+                else:
+                    try:
+                        # Validate it's a real date
+                        day, month, year = map(int, dob.split('/'))
+                        datetime(year=year, month=month, day=day)  # Will raise ValueError if invalid
+                        state.user_data["dob"] = dob
+                        age = calculate_age(dob)
+                        state.user_data["age"] = str(age)
+                        await send_text(ws, f"You are {age} years old. Thank you! Now, let's understand your financial goals better.")
+                        # Move to financial concern step
+                        state.step = "get_financial_concern"
+                        # Send the financial concern buttons
+                        await send_buttons(
+                            ws,
+                            "What's your biggest financial concern right now?",
+                            [
+                                {"label": "Protecting my family's income", "value": "income_protection"},
+                                {"label": "Covering medical expenses", "value": "medical_expenses"},
+                                {"label": "Saving for children's education", "value": "education"},
+                                {"label": "Building long-term wealth", "value": "wealth_building"},
+                                {"label": "Planning for retirement", "value": "retirement"}
+                            ]
+                        )
+                        state.step = "get_financial_concern_response"
+                        continue
+                    except (ValueError, IndexError):
+                        await send_text(ws, "Please enter a valid date of birth (DD/MM/YYYY):")
+                        continue
+            elif state.step == "get_financial_concern_response":
+                state.user_data["primary_concern"] = message_content.strip()
+                await send_buttons(
+                    ws,
+                    "Which best describes your current life stage?",
+                    [
+                        {"label": "Just starting a family", "value": "starting_family"},
+                        {"label": "Raising young children", "value": "raising_children"},
+                        {"label": "Paying off a home", "value": "home_owner"},
+                        {"label": "Nearing retirement", "value": "pre_retirement"},
+                        {"label": "Single and independent", "value": "single"},
+                        {"label": "Retired", "value": "retired"}
+                    ]
+                )
+                state.step = "get_life_stage"
+            elif state.step == "get_life_stage":
+                state.user_data["life_stage"] = message_content.strip()
+                # Move to the next step which will handle campaign recommendations
+                state.step = "get_dependents"
+                await send_buttons(
+                    ws,
+                    "How many people depend on your income?",
+                    [
+                        {"label": "Just myself", "value": "1"},
+                        {"label": "1 other person", "value": "2"},
+                        {"label": "2-3 people", "value": "3"},
+                        {"label": "4+ people", "value": "4"}
+                    ]
+                )
+                state.step = "get_dependents"
+            elif state.step == "get_dependents":
+                state.user_data["dependents"] = message_content.strip()
+                await send_buttons(
+                    ws,
+                    "Do you have any existing life or medical insurance?",
+                    [
+                        {"label": "No coverage at all", "value": "none"},
+                        {"label": "Basic employer coverage", "value": "basic"},
+                        {"label": "Some personal coverage", "value": "some"},
+                        {"label": "Comprehensive coverage", "value": "full"}
+                    ]
+                )
+                state.step = "get_existing_coverage"
+            elif state.step == "get_existing_coverage":
+                state.user_data["existing_coverage"] = message_content.strip()
+                await send_buttons(
+                    ws,
+                    "What's your budget for monthly premiums? (RM)",
+                    [
+                        {"label": "< RM200", "value": "<200"},
+                        {"label": "RM201 - RM500", "value": "201-500"},
+                        {"label": "RM501 - RM1000", "value": "501-1000"},
+                        {"label": "> RM1000", "value": ">1000"}
+                    ]
+                )
+                state.step = "get_premium_budget"
+            elif state.step == "get_premium_budget":
+                state.user_data["premium_budget"] = message_content.strip()
+                await send_text(ws, "Thank you for sharing your details! Let me analyze the best options for you...")
+                
+                # Show campaign options based on user responses
+                await show_campaign_options(ws, state)
+                state.step = "campaign_selection"
+                
+            elif state.step == "campaign_selection":
+                # Handle campaign selection response
+                try:
+                    # If user selected a campaign number
+                    if message_content.isdigit():
+                        selected_idx = int(message_content) - 1  # Convert to 0-based index
+                        # Define campaign mappings with proper display names
+                        campaign_mappings = {
+                            "satu_gaji_satu_harapan": "Satu Gaji Satu Harapan (Income Protection)",
+                            "tabung_perubatan": "Tabung Perubatan (Medical)",
+                            "masa_depan_anak_kita": "Masa Depan Anak Kita (Education)",
+                            "tabung_warisan": "Tabung Warisan (Retirement)",
+                            "perlindungan_combo": "Perlindungan Combo (Comprehensive)"
+                        }
+                        
+                        # Get the list of campaign IDs based on current view
+                        if state.user_data.get('showing_all_campaigns', False):
+                            campaign_ids = [
+                                "satu_gaji_satu_harapan",
+                                "tabung_perubatan",
+                                "masa_depan_anak_kita",
+                                "tabung_warisan",
+                                "perlindungan_combo"
+                            ]
+                        else:
+                            # Get the same campaigns that were shown in the buttons
+                            campaign_ids = [c for c in [
+                                "satu_gaji_satu_harapan" if state.user_data.get('priority_income', False) else None,
+                                "tabung_perubatan" if state.user_data.get('priority_medical', False) else None,
+                                "masa_depan_anak_kita" if state.user_data.get('priority_education', False) else None,
+                                "tabung_warisan" if state.user_data.get('priority_retirement', False) else None,
+                                "perlindungan_combo"  # Always include combo as fallback
+                            ] if c is not None]
+                        
+                        # Check if selected index is valid
+                        if 0 <= selected_idx < len(campaign_ids):
+                            campaign_id = campaign_ids[selected_idx]
+                            state.active_campaign = campaign_id
+                            state.step = f"campaign_{campaign_id}"
+                            
+                            # Log the campaign selection
+                            logger.info(f"Selected campaign: {campaign_id} (index: {selected_idx})")
+                            logger.info(f"Available campaign IDs: {campaign_ids}")
+                            
+                            # Get the display name from the mapping
+                            display_name = campaign_mappings.get(campaign_id, campaign_id.replace('_', ' ').title())
+                            logger.info(f"Display name: {display_name}")
+                            
+                            # Log the current working directory and files
+                            import os
+                            current_dir = os.path.dirname(os.path.abspath(__file__))
+                            campaign_dir = os.path.join(current_dir, 'Campaign1')
+                            logger.info(f"Current directory: {current_dir}")
+                            logger.info(f"Campaign directory exists: {os.path.exists(campaign_dir)}")
+                            if os.path.exists(campaign_dir):
+                                logger.info(f"Files in Campaign1 directory: {os.listdir(campaign_dir)}")
+                            
+                            # Create the state dictionary for the campaign
+                            campaign_state = {
+                                "user_id": conv_id,
+                                "message": "start",
+                                "campaign_data": state.user_data
+                            }
+                            
+                            try:
+                                # Import the campaign module dynamically
+                                import importlib
+                                package_name = campaign_dir
+                                full_module_path = f"{package_name}.{module_name}"
+                                logger.info(f"Attempting to import: {full_module_path}")
+                                
+                                # Add the current directory to Python path if not already there
+                                current_dir = os.path.dirname(os.path.abspath(__file__))
+                                if current_dir not in sys.path:
+                                    sys.path.insert(0, current_dir)
+                                logger.info(f"Current Python path: {sys.path}")
+                                
+                                # Try importing the module
+                                try:
+                                    campaign_module = importlib.import_module(full_module_path)
+                                    logger.info(f"Successfully imported module: {full_module_path}")
+                                    
+                                    # Log available attributes in the module
+                                    logger.info(f"Module attributes: {[attr for attr in dir(campaign_module) if not attr.startswith('__')]}")
+                                        sys.path.insert(0, current_dir)
+                                    logger.info(f"Current Python path: {sys.path}")
+                                    
+                                    # Try importing the module
+                                    try:
+                                        campaign_module = importlib.import_module(full_module_path)
+                                        logger.info(f"Successfully imported module: {full_module_path}")
+                                        
+                                        # Log available attributes in the module
+                                        logger.info(f"Module attributes: {[attr for attr in dir(campaign_module) if not attr.startswith('__')]}")
+                                        
+                                        # Check for the sgsa_campaign instance first
+                                        if hasattr(campaign_module, 'sgsa_campaign'):
+                                            logger.info("Found sgsa_campaign instance")
+                                            campaign_instance = campaign_module.sgsa_campaign
+                                            
+                                            # Start the campaign
+                                            logger.info(f"Starting campaign for user {conv_id}")
+                                            try:
+                                                await campaign_instance.start(ws, conv_id)
+                                                logger.info(f"Campaign started for user {conv_id}")
+                                                
+                                                # Store the campaign instance for future messages
+                                                campaign_handlers[conv_id] = campaign_instance
+                                                logger.info(f"Handler stored for user {conv_id}")
+                                                
+                                            except Exception as e:
+                                                logger.error(f"Error starting campaign for user {conv_id}: {str(e)}", exc_info=True)
+                                                raise
+                                                
+                                        # Fall back to main function if sgsa_campaign not found
+                                        elif hasattr(campaign_module, 'main'):
+                                            logger.info("Using main function")
+                                            try:
+                                                await campaign_module.main(
+                                                    ws=ws,
+                                                    state=campaign_state
+                                                )
+                                            except Exception as e:
+                                                logger.error(f"Error in main function: {str(e)}", exc_info=True)
+                                                raise
+                                                
+                                        else:
+                                            error_msg = f"No valid entry point found in module {full_module_path}"
+                                            logger.error(error_msg)
+                                            raise AttributeError(error_msg)
+                                            
+                                    except ImportError as ie:
+                                        logger.error(f"Failed to import module {full_module_path}: {str(ie)}", exc_info=True)
+                                        logger.info("Trying to import module directly from file...")
+                                        
+                                        # Try importing the module directly from file
+                                        try:
+                                            module_path = os.path.join(current_dir, package_name, f"{module_name}.py")
+                                            logger.info(f"Attempting to import directly from: {module_path}")
+                                            
+                                            # Use importlib.util to import the module from file
+                                            spec = importlib.util.spec_from_file_location(full_module_path, module_path)
+                                            if spec is None:
+                                                raise ImportError(f"Could not load spec from {module_path}")
+                                                
+                                            campaign_module = importlib.util.module_from_spec(spec)
+                                            spec.loader.exec_module(campaign_module)
+                                            logger.info(f"Successfully imported module from file: {module_path}")
+                                            
+                                            # Now try to get the sgsa_campaign instance
+                                            if hasattr(campaign_module, 'sgsa_campaign'):
+                                                logger.info("Found sgsa_campaign instance after direct import")
+                                                campaign_instance = campaign_module.sgsa_campaign
+                                                
+                                                # Start the campaign
+                                                logger.info(f"Starting campaign for user {conv_id} (direct import)")
+                                                try:
+                                                    await campaign_instance.start(ws, conv_id)
+                                                    logger.info(f"Campaign started for user {conv_id} (direct import)")
+                                                    
+                                                    # Store the campaign instance for future messages
+                                                    campaign_handlers[conv_id] = campaign_instance
+                                                    logger.info(f"Handler stored for user {conv_id} (direct import)")
+                                                    
+                                                except Exception as e:
+                                                    logger.error(f"Error starting campaign (direct import) for user {conv_id}: {str(e)}", exc_info=True)
+                                                    raise
+                                                    
+                                            else:
+                                                error_msg = f"No sgsa_campaign instance found in {module_path}"
+                                                logger.error(error_msg)
+                                                raise AttributeError(error_msg)
+                                                
+                                        except Exception as e:
+                                            logger.error(f"Failed to import module directly from file: {str(e)}", exc_info=True)
+                                            raise ImportError(f"Could not import module {full_module_path} using any method") from e
+                                                
+                                except ImportError as ie:
+                                    logger.error(f"Failed to import campaign module: {str(ie)}", exc_info=True)
+                                    logger.error(f"ImportError for module {full_module_path}: {str(ie)}", exc_info=True)
+                                    raise
+                                except Exception as e:
+                                    logger.error(f"Error in campaign module {full_module_path}: {str(e)}", exc_info=True)
+                                    raise
+                                
+                            except Exception as e:
+                                logger.error(f"Error launching campaign {campaign_id}: {str(e)}", exc_info=True)
+                                await send_text(ws, f"Sorry, I couldn't launch that campaign. Please try again or select another option.")
+                                await show_campaign_options(ws, state, show_all=state.user_data.get('showing_all_campaigns', False))
+                    elif message_content.lower() == "all":
+                        # Show all campaigns
+                        state.user_data['showing_all_campaigns'] = True
+                        await show_campaign_options(ws, state, show_all=True)
+                    else:
+                        # Process the message through the campaign handler if one exists
+                        if conv_id in campaign_handlers:
+                            try:
+                                handler = campaign_handlers[conv_id]
+                                logger.info(f"Processing message in campaign handler for {conv_id}")
+                                
+                                # Add a timeout to prevent hanging
+                                try:
+                                    import asyncio
+                                    await asyncio.wait_for(
+                                        handler.process_message(conv_id, message_content, ws),
+                                        timeout=30.0  # 30 second timeout
+                                    )
+                                    logger.info(f"Successfully processed message for {conv_id}")
+                                    
+                                except asyncio.TimeoutError:
+                                    logger.error(f"Timeout processing message for {conv_id}")
+                                    await ws.send_text(json.dumps({
+                                        "type": "error",
+                                        "content": "⌛ The operation is taking longer than expected. Please try again.",
+                                        "is_user": False
+                                    }))
+                                    
+                            except Exception as e:
+                                logger.error(f"Error processing message in campaign handler: {str(e)}", exc_info=True)
+                                
+                                # Clean up the handler to prevent further issues
+                                if conv_id in campaign_handlers:
+                                    del campaign_handlers[conv_id]
+                                    logger.info(f"Removed handler for {conv_id} due to error")
+                                    
+                                await ws.send_text(json.dumps({
+                                    "type": "error",
+                                    "content": "❌ An error occurred while processing your message. The conversation has been reset. Please start over.",
+                                    "is_user": False
+                                }))
+                                
+                                # Show campaign options again
+                                await show_campaign_options(ws, state, show_all=state.user_data.get('showing_all_campaigns', False))
+                        else:
+                            await send_text(ws, "Please select a valid option from the buttons above.")
+                except Exception as e:
+                    logger.error(f"Error handling campaign selection: {str(e)}", exc_info=True)
+                    await ws.send_text(json.dumps({
+                        "type": "error",
+                        "content": "Sorry, we encountered an error processing your selection. Please try again.",
+                        "is_user": False
+                    }, ensure_ascii=False))
+            else:
+                response = {"type": "message", "content": "Conversation completed."}
+                conversation_active = False
+            if response:
+                await ws.send_text(json.dumps(response))
+        except WebSocketDisconnect:
+            logger.info(f"WebSocket disconnected: {conv_id}")
+            break
+        except Exception as e:
+            logger.error(f"Error in WebSocket connection {conv_id}: {str(e)}", exc_info=True)
+            try:
+                await ws.send_text(json.dumps({"type": "error", "content": "❌ An error occurred. Please try again."}))
+            except Exception as send_error:
+                logger.error(f"Failed to send error message: {str(send_error)}")
+    # Ensure the conversation state starts with asking for name
+    if conv_id in active_conversations:
+        active_conversations[conv_id].step = "get_name"
+    # Clean up conversation state after disconnect
+    if conv_id in active_conversations:
+        del active_conversations[conv_id]
+
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run(app, host="0.0.0.0", port=8000)

@@ -1,0 +1,20 @@
+services:
+  - type: web
+    name: aibot-chatbot
+    env: python3
+    region: singapore  # Choose the closest region to your users
+    buildCommand: |
+      pip install --upgrade pip &&
+      pip install -r requirements.txt
+    startCommand: gunicorn main:app --worker-class uvicorn.workers.UvicornWorker --bind 0.0.0.0:$PORT --timeout 120
+    envVars:
+      - key: PYTHON_VERSION
+        value: 3.12.5
+      - key: PYTHONUNBUFFERED
+        value: true
+      - key: WEB_CONCURRENCY
+        value: 1  # Adjust based on your plan
+    plan: free
+    numInstances: 1
+    healthCheckPath: /  # Health check endpoint
+    autoDeploy: true
